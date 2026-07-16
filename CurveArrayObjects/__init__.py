@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CurveArrayObjects",
     "author": "Zack3D",
-    "version": (2, 8, 0),
+    "version": (3, 0, 5),
     "blender": (4, 3, 0),
     "location": "View3D > N 面板 > 曲線陣列",
     "description": "沿曲線陣列複製物件或整個集合（純 Python 版，不使用幾何節點）",
@@ -79,11 +79,13 @@ def _at(poly, cum, total, d):
 # 來源物件
 # ─────────────────────────────────────────────────────────────
 def _sources(s):
+    owner = s.id_data          # 這條曲線自己，絕不能當來源（會無限迴圈）
     if s.source_collection:
-        objs = [o for o in s.source_collection.all_objects if not o.get("_curve_array_child")]
+        objs = [o for o in s.source_collection.all_objects
+                if not o.get("_curve_array_child") and o is not owner]
         if objs:
             return objs
-    if s.target:
+    if s.target and s.target is not owner:
         return [s.target]
     return []
 
@@ -92,7 +94,7 @@ def _pick(s, sources, i):
     if len(sources) == 1:
         return sources[0]
     if s.random_pick:
-        return random.Random(s.seed * 100003 + i).choice(sources)
+        return random.Random(s.pick_seed * 100003 + i).choice(sources)
     return sources[i % len(sources)]
 
 
@@ -195,20 +197,43 @@ def _clear(coll):
 def _apply_transforms(obj, dups, items):
     s = obj.curve_array
     off = Euler((s.rot_offset[0], s.rot_offset[1], s.rot_offset[2]), 'XYZ').to_matrix()
-    for dup, item in zip(dups, items):
+    use_rand = (any(abs(v) > 1e-6 for v in s.rand_loc)
+                or any(abs(v) > 1e-6 for v in s.rand_rot)
+                or s.rand_scale > 1e-6)
+
+    for idx, (dup, item) in enumerate(zip(dups, items)):
         pos, tan, tilt, rad, _src_ref = item
         src = bpy.data.objects.get(dup.get("_ca_src", ""))
         src_rot = src.rotation_euler.to_matrix() if src else Matrix.Identity(3)
         src_scale = Vector(src.scale) if src else Vector((1.0, 1.0, 1.0))
 
-        m = s.size * rad          # 全域大小 × 曲線半徑(Alt+S)
-        dup.scale = (src_scale.x * m, src_scale.y * m, src_scale.z * m)
-        dup.location = pos
+        # 曲線的區域座標框（X＝沿線方向、Y/Z＝側向），含 Ctrl+T 傾斜
         if s.align and tan.length > 0:
             rmat = tan.to_track_quat('X', 'Z').to_matrix() @ Matrix.Rotation(tilt, 3, 'X')
         else:
             rmat = Matrix.Rotation(tilt, 3, 'Z') if tilt else Matrix.Identity(3)
-        dup.rotation_euler = (rmat @ src_rot @ off).to_euler()
+
+        m = s.size * rad          # 全域大小 × 曲線半徑(Alt+S)
+        loc = pos.copy()
+        rnd = Matrix.Identity(3)
+
+        if use_rand:
+            # 依種子＋序號產生：結果可重現，不會每次刷新就亂跳
+            rng = random.Random(s.seed * 7919 + idx)
+            ofs = Vector((rng.uniform(-s.rand_loc[0], s.rand_loc[0]),
+                          rng.uniform(-s.rand_loc[1], s.rand_loc[1]),
+                          rng.uniform(-s.rand_loc[2], s.rand_loc[2])))
+            if ofs.length > 0:
+                loc = loc + (rmat @ ofs)          # 位移在曲線的區域座標
+            rnd = Euler((rng.uniform(-s.rand_rot[0], s.rand_rot[0]),
+                         rng.uniform(-s.rand_rot[1], s.rand_rot[1]),
+                         rng.uniform(-s.rand_rot[2], s.rand_rot[2])), 'XYZ').to_matrix()
+            if s.rand_scale > 1e-6:
+                m *= 1.0 + rng.uniform(-s.rand_scale, s.rand_scale)
+
+        dup.location = loc
+        dup.scale = (src_scale.x * m, src_scale.y * m, src_scale.z * m)
+        dup.rotation_euler = (rmat @ src_rot @ off @ rnd).to_euler()
 
 
 def _update_array(obj, rebuild=True, sync_mods=False):
@@ -327,6 +352,8 @@ def _auto_update_toggle(self, context):
 
 
 def _target_poll(self, obj):
+    if obj is self.id_data:        # 不能選這條曲線自己
+        return False
     return obj.type in {'MESH', 'CURVE', 'FONT', 'SURFACE', 'META', 'EMPTY'} \
         and not obj.get("_curve_array_child")
 
@@ -340,7 +367,12 @@ class CurveArraySettings(PropertyGroup):
     source_collection: PointerProperty(name="選擇集合", type=bpy.types.Collection,
                                        update=_prop_update)
     random_pick: BoolProperty(name="隨機挑選", default=False, update=_prop_update)
-    seed: IntProperty(name="隨機種子", default=0, update=_prop_update)
+    pick_seed: IntProperty(name="隨機種子", default=0,
+                           description="換數字＝換一組「從集合挑哪個物件」的組合（不影響隨機散佈）",
+                           update=_prop_update)
+    seed: IntProperty(name="隨機種子", default=0,
+                      description="換數字＝換一組隨機散佈結果（不影響集合的隨機挑選）",
+                      update=_prop_update)
 
     count: IntProperty(name="數量", default=6, min=1, max=2000, update=_prop_update)
     size: FloatProperty(name="物件大小", default=1.0, min=0.0, update=_prop_update)
@@ -353,6 +385,27 @@ class CurveArraySettings(PropertyGroup):
     align: BoolProperty(name="對齊曲線方向", default=True, update=_prop_update)
     rot_offset: FloatVectorProperty(name="物件自轉", subtype='EULER', size=3,
                                     default=(0.0, 0.0, 0.0), update=_prop_update)
+
+    # 面板分區的收合狀態（純 UI）
+    show_source: BoolProperty(name="來源", default=True)
+    show_layout: BoolProperty(name="排列", default=True)
+    show_object: BoolProperty(name="物件", default=True)
+    show_curve: BoolProperty(name="曲線外觀", default=False)
+
+    # 隨機散佈（用種子產生，可重現）
+    show_random: BoolProperty(name="隨機散佈", default=False,
+                              description="展開／收合隨機散佈設定")
+    rand_loc: FloatVectorProperty(name="隨機位移", subtype='TRANSLATION', size=3,
+                                  default=(0.0, 0.0, 0.0), min=0.0,
+                                  description="每個物件隨機位移的範圍（±）。X＝沿曲線、Y/Z＝側向",
+                                  update=_prop_update)
+    rand_rot: FloatVectorProperty(name="隨機旋轉", subtype='EULER', size=3,
+                                  default=(0.0, 0.0, 0.0), min=0.0,
+                                  description="每個物件隨機旋轉的範圍（±）",
+                                  update=_prop_update)
+    rand_scale: FloatProperty(name="隨機縮放", default=0.0, min=0.0, max=1.0,
+                              description="每個物件隨機縮放的幅度（±比例，0.3＝±30%）",
+                              update=_prop_update)
 
     auto_update: BoolProperty(name="自動更新（跟隨曲線）", default=True,
                               update=_auto_update_toggle)
@@ -454,6 +507,16 @@ class CURVEARRAY_OT_clear(Operator):
 # ─────────────────────────────────────────────────────────────
 # 面板
 # ─────────────────────────────────────────────────────────────
+def _section(layout, s, prop, label, icon='NONE'):
+    """畫一個可收合的深色區塊；展開時回傳 box 供填內容，收合時回傳 None。"""
+    box = layout.box()
+    head = box.row(align=True)
+    head.prop(s, prop, text="", emboss=False,
+              icon='TRIA_DOWN' if getattr(s, prop) else 'TRIA_RIGHT')
+    head.label(text=label, icon=icon)
+    return box if getattr(s, prop) else None
+
+
 class CURVEARRAY_PT_panel(Panel):
     bl_label = "曲線陣列"
     bl_idname = "VIEW3D_PT_curve_array_objects"
@@ -474,43 +537,68 @@ class CURVEARRAY_PT_panel(Panel):
             layout.operator("curvearray.create", icon='CURVE_DATA')
             return
 
-        col = layout.column()
-        col.prop(s, "target")
-        col.prop(s, "source_collection")
-        if s.source_collection:
-            col.label(text="（有選集合時，優先用集合裡的物件排列）", icon='INFO')
-            row = col.row(align=True)
-            row.prop(s, "random_pick")
-            if s.random_pick:
-                row.prop(s, "seed")
+        # ── 來源：要排什麼 ──
+        b = _section(layout, s, "show_source", "來源", 'OBJECT_DATA')
+        if b:
+            row = b.row()
+            row.enabled = not s.source_collection      # 有選集合時，物件欄變灰（集合優先）
+            row.prop(s, "target")
+            b.prop(s, "source_collection")
+            if s.source_collection:
+                r = b.row(align=True)
+                r.prop(s, "random_pick")
+                if s.random_pick:
+                    r.prop(s, "pick_seed", text="種子")
 
-        col.separator()
-        col.prop(s, "count")
-        col.prop(s, "size")
-        col.prop(s, "spacing_by_size")
-        col.prop(s, "align")
-        col.prop(s, "rot_offset")
-        row = col.row(align=True)
-        row.prop(s, "start")
-        row.prop(s, "end")
+        # ── 排列：排幾個、排在哪 ──
+        b = _section(layout, s, "show_layout", "排列", 'MOD_ARRAY')
+        if b:
+            b.prop(s, "count")
+            b.prop(s, "spacing_by_size")
+            row = b.row(align=True)
+            row.prop(s, "start")
+            row.prop(s, "end")
+            rb = _section(b, s, "show_random", "隨機散佈", 'MOD_PARTICLES')
+            if rb:
+                rb.prop(s, "rand_loc")
+                rb.prop(s, "rand_rot")
+                rb.prop(s, "rand_scale")
+                rb.prop(s, "seed")
 
-        col.separator()
-        col.prop(obj.data, "bevel_depth", text="曲線粗細")
-        col.prop(obj.data, "use_fill_caps", text="曲線封口")
-        col.prop(obj, "show_in_front", text="曲線顯示在前面")
+        # ── 物件：排出來長怎樣 ──
+        b = _section(layout, s, "show_object", "物件", 'MESH_DATA')
+        if b:
+            b.prop(s, "size")
+            b.prop(s, "align")
+            b.prop(s, "rot_offset")
 
+        # ── 曲線外觀：曲線自己的屬性（次要，預設收起）──
+        b = _section(layout, s, "show_curve", "曲線外觀", 'CURVE_DATA')
+        if b:
+            b.prop(obj.data, "bevel_depth", text="曲線粗細")
+            row = b.row(align=True)
+            row.prop(obj, "show_in_front", text="顯示在前面")
+            row.prop(obj.data, "use_fill_caps", text="曲線封口")
+
+        # ── 狀態：跟隨 or 解鎖編輯（狀態直接寫在按鈕上）──
         layout.separator()
         box = layout.box()
-        box.prop(s, "auto_update", icon='FILE_REFRESH')
-        if not s.auto_update:
-            box.label(text="已暫停跟隨，可個別編輯陣列物件", icon='UNLOCKED')
-        box.operator("curvearray.sync_mods", icon='MODIFIER')
+        r = box.row()
+        r.scale_y = 1.3
+        if s.auto_update:
+            r.prop(s, "auto_update", toggle=True, icon='LOCKED', text="跟隨曲線中")
+        else:
+            r.prop(s, "auto_update", toggle=True, icon='UNLOCKED', text="已解鎖・可編輯")
 
+        # ── 動作 ──
         layout.separator()
-        r = layout.row(align=True)
-        r.operator("curvearray.update", icon='FILE_REFRESH')
-        r.operator("curvearray.apply", icon='CHECKMARK')
-        layout.operator("curvearray.clear", icon='X')
+        acts = layout.column(align=True)
+        row = acts.row(align=True)
+        row.operator("curvearray.update", icon='FILE_REFRESH')
+        row.operator("curvearray.sync_mods", text="同步修改器", icon='MODIFIER')
+        row = acts.row(align=True)
+        row.operator("curvearray.apply", icon='CHECKMARK')
+        row.operator("curvearray.clear", text="清除", icon='X')
 
 
 classes = (
