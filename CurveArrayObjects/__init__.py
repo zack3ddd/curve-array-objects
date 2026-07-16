@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CurveArrayObjects",
     "author": "Zack3D",
-    "version": (2, 6, 0),
+    "version": (2, 8, 0),
     "blender": (4, 3, 0),
     "location": "View3D > N 面板 > 曲線陣列",
     "description": "沿曲線陣列複製物件或整個集合（純 Python 版，不使用幾何節點）",
@@ -153,7 +153,28 @@ def _placements(obj):
 # 產生 / 更新 / 清除
 # ─────────────────────────────────────────────────────────────
 _busy = False
-_pending = set()
+_pending = set()        # 只重新定位（拉曲線用，維持順暢）
+_pending_sync = set()   # 來源幾何/修改器變動 → 同步修改器＋定位
+
+
+def _sync_modifiers(src, dup):
+    """把來源物件的修改器堆疊同步到複製物件（讓外面改、裡面即時跟）。"""
+    try:
+        if [m.type for m in dup.modifiers] != [m.type for m in src.modifiers]:
+            dup.modifiers.clear()
+            for m in src.modifiers:
+                dup.modifiers.new(m.name, m.type)
+        for sm, dm in zip(src.modifiers, dup.modifiers):
+            for prop in sm.bl_rna.properties:
+                pid = prop.identifier
+                if prop.is_readonly or pid in {'rna_type', 'type', 'name', 'is_active'}:
+                    continue
+                try:
+                    setattr(dm, pid, getattr(sm, pid))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def _ensure_collection(obj):
@@ -190,7 +211,7 @@ def _apply_transforms(obj, dups, items):
         dup.rotation_euler = (rmat @ src_rot @ off).to_euler()
 
 
-def _update_array(obj, rebuild=True):
+def _update_array(obj, rebuild=True, sync_mods=False):
     if obj is None or obj.type != 'CURVE':
         return
     s = obj.curve_array
@@ -207,28 +228,43 @@ def _update_array(obj, rebuild=True):
         _clear(coll)
         existing = []
         for (pos, tan, tilt, rad, src) in items:
-            dup = src.copy()
+            dup = src.copy()          # 連結複製：共用網格資料、並帶當下的修改器堆疊
             dup["_curve_array_child"] = 1
             dup["_ca_src"] = src.name
             dup.hide_select = True
             coll.objects.link(dup)
             existing.append(dup)
+    elif sync_mods:
+        for dup in existing:
+            src = bpy.data.objects.get(dup.get("_ca_src", ""))
+            if src:
+                _sync_modifiers(src, dup)
     _apply_transforms(obj, existing, items)
 
 
 # ─────────────────────────────────────────────────────────────
 # 即時更新
 # ─────────────────────────────────────────────────────────────
+def _ok(obj):
+    return obj and obj.type == 'CURVE' and obj.curve_array.enabled and obj.curve_array.auto_update
+
+
 def _process_pending():
     global _busy
-    names = list(_pending)
+    sync_names = set(_pending_sync)
+    move_names = set(_pending) - sync_names
+    _pending_sync.clear()
     _pending.clear()
     _busy = True
     try:
-        for name in names:
+        for name in sync_names:                       # 原件幾何/修改器變了 → 同步修改器＋定位
             obj = bpy.data.objects.get(name)
-            if obj and obj.type == 'CURVE' and obj.curve_array.enabled and obj.curve_array.auto_update:
-                _update_array(obj, rebuild=False)
+            if _ok(obj):
+                _update_array(obj, rebuild=False, sync_mods=True)
+        for name in move_names:                       # 只是拉曲線/搬原件 → 只定位（快）
+            obj = bpy.data.objects.get(name)
+            if _ok(obj):
+                _update_array(obj, rebuild=False, sync_mods=False)
     finally:
         _busy = False
     return None
@@ -238,7 +274,14 @@ def _process_pending():
 def _depsgraph_handler(scene, depsgraph):
     if _busy:
         return
-    updated = {u.id.original for u in depsgraph.updates}
+    any_ids = set()
+    geo_ids = set()
+    for u in depsgraph.updates:
+        oid = u.id.original
+        any_ids.add(oid)
+        if getattr(u, 'is_updated_geometry', False):
+            geo_ids.add(oid)
+
     hit = False
     for obj in scene.objects:
         if obj.type != 'CURVE':
@@ -246,14 +289,18 @@ def _depsgraph_handler(scene, depsgraph):
         s = getattr(obj, 'curve_array', None)
         if not (s and s.enabled and s.auto_update and (s.target or s.source_collection)):
             continue
-        dirty = obj.original in updated or (obj.data and obj.data.original in updated)
-        if not dirty:
-            for src in _sources(s):
-                sdata = getattr(src, 'data', None)
-                if src.original in updated or (sdata and sdata.original in updated):
-                    dirty = True
-                    break
-        if dirty:
+        dirty = obj.original in any_ids or (obj.data and obj.data.original in any_ids)
+        src_geo = False
+        for src in _sources(s):
+            sdata = getattr(src, 'data', None)
+            if src.original in geo_ids or (sdata and sdata.original in geo_ids):
+                src_geo = True          # 原件的幾何/修改器變了
+            if src.original in any_ids or (sdata and sdata.original in any_ids):
+                dirty = True
+        if src_geo:
+            _pending_sync.add(obj.name)
+            hit = True
+        elif dirty:
             _pending.add(obj.name)
             hit = True
     if hit and not bpy.app.timers.is_registered(_process_pending):
@@ -342,6 +389,28 @@ class CURVEARRAY_OT_update(Operator):
 
     def execute(self, context):
         _update_array(context.object, rebuild=True)
+        return {'FINISHED'}
+
+
+class CURVEARRAY_OT_sync_mods(Operator):
+    bl_idname = "curvearray.sync_mods"
+    bl_label = "與來源同步修改器"
+    bl_description = "把來源物件目前的修改器堆疊重新同步到陣列裡的所有物件（會覆蓋你對個別物件的修改器調整）"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj and obj.type == 'CURVE' and obj.curve_array.collection is not None
+
+    def execute(self, context):
+        s = context.object.curve_array
+        n = 0
+        for dup in s.collection.objects:
+            src = bpy.data.objects.get(dup.get("_ca_src", ""))
+            if src:
+                _sync_modifiers(src, dup)
+                n += 1
+        self.report({'INFO'}, "已同步 %d 個物件的修改器" % n)
         return {'FINISHED'}
 
 
@@ -435,6 +504,7 @@ class CURVEARRAY_PT_panel(Panel):
         box.prop(s, "auto_update", icon='FILE_REFRESH')
         if not s.auto_update:
             box.label(text="已暫停跟隨，可個別編輯陣列物件", icon='UNLOCKED')
+        box.operator("curvearray.sync_mods", icon='MODIFIER')
 
         layout.separator()
         r = layout.row(align=True)
@@ -447,6 +517,7 @@ classes = (
     CurveArraySettings,
     CURVEARRAY_OT_create,
     CURVEARRAY_OT_update,
+    CURVEARRAY_OT_sync_mods,
     CURVEARRAY_OT_apply,
     CURVEARRAY_OT_clear,
     CURVEARRAY_PT_panel,
