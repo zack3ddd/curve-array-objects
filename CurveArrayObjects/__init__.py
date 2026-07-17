@@ -4,7 +4,7 @@ bl_info = {
     "version": (3, 0, 5),
     "blender": (4, 3, 0),
     "location": "View3D > N 面板 > 曲線陣列",
-    "description": "沿曲線陣列複製物件或整個集合（純 Python 版，不使用幾何節點）",
+    "description": "沿曲線陣列複製物件或整個集合，可即時跟隨曲線",
     "category": "Object",
 }
 
