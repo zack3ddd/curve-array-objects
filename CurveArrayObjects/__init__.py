@@ -1,15 +1,16 @@
 bl_info = {
     "name": "CurveArrayObjects",
     "author": "Zack3D",
-    "version": (3, 0, 5),
+    "version": (3, 2, 1),
     "blender": (4, 3, 0),
     "location": "View3D > N 面板 > 曲線陣列",
-    "description": "沿曲線陣列複製物件或整個集合，可即時跟隨曲線",
+    "description": "沿曲線陣列複製物件或整個集合，可即時跟隨曲線，並支援隨機散佈與沿曲線變形",
     "category": "Object",
 }
 
 import bpy
 import bisect
+import math
 import random
 from bpy.app.handlers import persistent
 from bpy.props import (BoolProperty, IntProperty, FloatProperty,
@@ -22,16 +23,102 @@ from mathutils.geometry import interpolate_bezier
 # ─────────────────────────────────────────────────────────────
 # 曲線 → polyline（世界座標，每點帶 tilt / radius）＋ 弧長取點
 # ─────────────────────────────────────────────────────────────
+def _nurbs_knots(n, order, cyclic, endpoint):
+    """n＝控制點數（迴圈時已含尾端補點）。回傳 n+order 個節點。"""
+    if cyclic or not endpoint:
+        return [float(i) for i in range(n + order)]
+    inner = [float(i) for i in range(1, n - order + 1)]
+    return [0.0] * order + inner + [float(n - order + 1)] * order
+
+
+def _nurbs_span(n, p, u, U):
+    if u >= U[n]:
+        return n - 1
+    if u <= U[p]:
+        return p
+    lo, hi = p, n
+    mid = (lo + hi) // 2
+    while u < U[mid] or u >= U[mid + 1]:
+        if u < U[mid]:
+            hi = mid
+        else:
+            lo = mid
+        mid = (lo + hi) // 2
+    return mid
+
+
+def _nurbs_basis(i, u, p, U):
+    """Cox–de Boor：回傳該 span 上 p+1 個非零基底函數。"""
+    N = [0.0] * (p + 1)
+    left = [0.0] * (p + 1)
+    right = [0.0] * (p + 1)
+    N[0] = 1.0
+    for j in range(1, p + 1):
+        left[j] = u - U[i + 1 - j]
+        right[j] = U[i + j] - u
+        saved = 0.0
+        for r in range(j):
+            denom = right[r + 1] + left[j - r]
+            temp = N[r] / denom if abs(denom) > 1e-12 else 0.0
+            N[r] = saved + right[r + 1] * temp
+            saved = left[j - r] * temp
+        N[j] = saved
+    return N
+
+
+def _nurbs_polyline(spline, mw, res=16):
+    """自己求值 NURBS（Blender 的 to_curve 不會求值，to_mesh 又會被 bevel 汙染）。"""
+    cps = [(Vector(p.co[:3]), p.tilt, p.radius, p.co[3]) for p in spline.points]
+    if len(cps) < 2:
+        return []
+    cyclic = spline.use_cyclic_u
+    order = max(2, min(spline.order_u, len(cps)))
+    if cyclic:
+        cps = cps + cps[:order - 1]
+    n = len(cps)
+    if n < order:
+        return []
+    p = order - 1
+    U = _nurbs_knots(n, order, cyclic, spline.use_endpoint_u)
+    u0, u1 = U[p], U[n]
+    if u1 - u0 <= 1e-9:
+        return []
+
+    segs = len(spline.points) if cyclic else len(spline.points) - 1
+    steps = max(2, int(res * max(1, segs)))
+    out = []
+    for k in range(steps + 1):
+        u = u0 + (u1 - u0) * k / steps
+        if u > u1:
+            u = u1
+        i = _nurbs_span(n, p, u, U)
+        N = _nurbs_basis(i, u, p, U)
+        pos = Vector((0.0, 0.0, 0.0))
+        tilt = rad = wsum = 0.0
+        for j in range(order):
+            cp = cps[i - p + j]
+            nw = N[j] * cp[3]
+            pos += cp[0] * nw
+            tilt += cp[1] * nw
+            rad += cp[2] * nw
+            wsum += nw
+        if abs(wsum) < 1e-12:
+            continue
+        out.append((mw @ (pos / wsum), tilt / wsum, rad / wsum))
+    return out
+
+
 def _first_polyline(curve_obj, res=16):
     mw = curve_obj.matrix_world
     for spline in curve_obj.data.splines:
         pts = []  # (world_pos, tilt, radius)
+        cyclic = spline.use_cyclic_u
         if spline.type == 'BEZIER':
             bp = spline.bezier_points
             n = len(bp)
             if n < 2:
                 continue
-            segs = n if spline.use_cyclic_u else n - 1
+            segs = n if cyclic else n - 1
             for i in range(segs):
                 a = bp[i]
                 b = bp[(i + 1) % n]
@@ -41,25 +128,89 @@ def _first_polyline(curve_obj, res=16):
                     pts.append((mw @ v,
                                 a.tilt + (b.tilt - a.tilt) * t,
                                 a.radius + (b.radius - a.radius) * t))
+        elif spline.type == 'NURBS':
+            pts = _nurbs_polyline(spline, mw, res)
         else:
             for p in spline.points:
                 pts.append((mw @ Vector(p.co[:3]), p.tilt, p.radius))
+            if cyclic and len(pts) >= 2:
+                pts.append(pts[0])          # 封閉：補回起點把迴圈接起來
         if len(pts) >= 2:
-            return pts
-    return []
+            return pts, cyclic
+    return [], False
+
+
+def _frames(poly, cyclic):
+    """平行移動框架：沿曲線把「上方向」一路帶著走。每個「點」一組 (切線, 上方向)。
+
+    不用世界軸當參考，所以曲線走垂直時不會退化翻面（to_track_quat 的老問題），
+    而且扭轉量最小——跟 Blender 自己算曲線法線的原理相同。
+
+    存在「點」上而不是「段」上，是為了讓 _at 能連續內插：段常數的框架會在段與段
+    之間跳一下，位置連續、方向不連續 → 變形時跨在交界上的頂點會被甩開，物件面數
+    一多就在轉彎處裂開。
+    """
+    n = len(poly)
+    if n < 2:
+        return []
+    pts = [p[0] for p in poly]
+    m = n - 1 if cyclic else n          # 封閉時最後一點與第一點重合
+
+    tans = []
+    for i in range(n):
+        if cyclic:
+            a, b = pts[(i - 1) % m], pts[(i + 1) % m]
+        else:
+            a, b = pts[max(0, i - 1)], pts[min(n - 1, i + 1)]
+        t = b - a
+        tans.append(t.normalized() if t.length > 1e-12 else Vector((1.0, 0.0, 0.0)))
+
+    up = Vector((0.0, 0.0, 1.0))
+    if abs(tans[0].dot(up)) > 0.99:     # 起點就垂直 → 換一個參考軸
+        up = Vector((1.0, 0.0, 0.0))
+    v = up - tans[0] * up.dot(tans[0])
+    nrms = [v.normalized() if v.length > 1e-9 else Vector((0.0, 0.0, 1.0))]
+    for i in range(1, n):
+        v = tans[i - 1].rotation_difference(tans[i]) @ nrms[-1]
+        v = v - tans[i] * v.dot(tans[i])          # 重新正交化，避免累積漂移
+        nrms.append(v.normalized() if v.length > 1e-9 else nrms[-1])
+
+    if cyclic:
+        # 繞一圈後上方向接不回起點 → 把落差平均分攤掉，否則接縫處會扭一下
+        c = nrms[-1] - tans[0] * nrms[-1].dot(tans[0])
+        if c.length > 1e-9:
+            c.normalize()
+            ang = nrms[0].angle(c)
+            if tans[0].dot(nrms[0].cross(c)) > 0:
+                ang = -ang
+            for i in range(n):
+                f = i / (n - 1)
+                nrms[i] = (Matrix.Rotation(ang * f, 3, tans[i]) @ nrms[i]).normalized()
+    return list(zip(tans, nrms))
 
 
 def _curve_data(obj):
-    poly = _first_polyline(obj)
+    poly, cyclic = _first_polyline(obj)
+    if len(poly) < 2:
+        return None
+    # 濾掉幾乎重合的點：貝茲每段的接點會被前後兩段各加一次，因浮點誤差不會剛好相等
+    # （相距 ~1e-7），拿這種線段算切線會得到數值垃圾 → 物件方向亂翻。用相對閾值才擋得住。
+    step = max((poly[i + 1][0] - poly[i][0]).length for i in range(len(poly) - 1))
+    eps = max(1e-9, step * 1e-3)
+    clean = [poly[0]]
+    for p in poly[1:]:
+        if (p[0] - clean[-1][0]).length > eps:
+            clean.append(p)
+    poly = clean
     if len(poly) < 2:
         return None
     cum = [0.0]
     for i in range(1, len(poly)):
         cum.append(cum[-1] + (poly[i][0] - poly[i - 1][0]).length)
-    return poly, cum, cum[-1]
+    return poly, cum, cum[-1], cyclic, _frames(poly, cyclic)
 
 
-def _at(poly, cum, total, d):
+def _at(poly, cum, total, d, frames=None):
     d = max(0.0, min(total, d))
     j = bisect.bisect_right(cum, d) - 1
     j = max(0, min(j, len(poly) - 2))
@@ -67,12 +218,23 @@ def _at(poly, cum, total, d):
     lf = 0.0 if seg <= 0 else (d - cum[j]) / seg
     p0, p1 = poly[j], poly[j + 1]
     pos = p0[0].lerp(p1[0], lf)
-    tan = (p1[0] - p0[0])
-    if tan.length > 0:
-        tan.normalize()
     tilt = p0[1] + (p1[1] - p0[1]) * lf
     rad = p0[2] + (p1[2] - p0[2]) * lf
-    return pos, tan, tilt, rad
+
+    if frames and j + 1 < len(frames):
+        # 在兩個點的框架之間連續內插，方向才不會在段交界上跳（變形裂縫的來源）
+        t0, n0 = frames[j]
+        t1, n1 = frames[j + 1]
+        tan = t0.lerp(t1, lf)
+        tan = tan.normalized() if tan.length > 1e-9 else t0.copy()
+        nrm = n0.lerp(n1, lf)
+        nrm = nrm.normalized() if nrm.length > 1e-9 else n0.copy()
+    else:
+        tan = p1[0] - p0[0]
+        if tan.length > 0:
+            tan.normalize()
+        nrm = None
+    return pos, tan, tilt, rad, nrm
 
 
 # ─────────────────────────────────────────────────────────────
@@ -107,7 +269,7 @@ def _placements(obj):
     data = _curve_data(obj)
     if not data:
         return []
-    poly, cum, total = data
+    poly, cum, total, cyclic, frames = data
     if total <= 0:
         return []
     sources = _sources(s)
@@ -123,22 +285,27 @@ def _placements(obj):
     if count == 1:
         dists = [d0]
     else:
-        even = [d0 + span * i / (count - 1) for i in range(count)]
+        # 封閉曲線且用整條時，尾＝頭：要用 count 等分（留一段繞回起點），否則首尾會重疊
+        loop = cyclic and s.start <= 1e-6 and s.end >= 1.0 - 1e-6
+        ngaps = count if loop else count - 1
+        even = [d0 + span * i / ngaps for i in range(count)]
         w = s.spacing_by_size
         if abs(w) > 1e-6:
-            radii = [_at(poly, cum, total, d)[3] for d in even]
+            radii = [_at(poly, cum, total, d, frames)[3] for d in even]
             mean_r = sum(radii) / len(radii)
             if abs(mean_r) < 1e-6:
                 mean_r = 1.0
             raw = []
-            for i in range(count - 1):
-                rr = max(0.05, ((radii[i] + radii[i + 1]) / 2.0) / mean_r)
-                raw.append(rr ** w)      # w>0：半徑大處 → 間距大（正比）
+            for i in range(ngaps):
+                a = radii[i]
+                b = radii[(i + 1) % count]      # 迴圈時最後一段接回第一個
+                rr = max(0.05, ((a + b) / 2.0) / mean_r)
+                raw.append(rr ** w)             # w>0：半徑大處 → 間距大（正比）
             tot = sum(raw) or 1.0
             scale = span / tot
             dists = [d0]
             d = d0
-            for st in raw:
+            for st in raw[:count - 1]:          # 只擺 count 個點；迴圈的最後一段留空繞回
                 d += st * scale
                 dists.append(d)
         else:
@@ -146,8 +313,8 @@ def _placements(obj):
 
     out = []
     for i, dd in enumerate(dists):
-        pos, tan, tilt, rad = _at(poly, cum, total, dd)
-        out.append((pos, tan, tilt, rad, srcs[i]))
+        pos, tan, tilt, rad, nrm = _at(poly, cum, total, dd, frames)
+        out.append((pos, tan, tilt, rad, srcs[i], dd, nrm))
     return out
 
 
@@ -182,8 +349,10 @@ def _sync_modifiers(src, dup):
 def _ensure_collection(obj):
     s = obj.curve_array
     if s.collection is not None:
+        s.collection["_ca_owned"] = True
         return s.collection
     coll = bpy.data.collections.new("曲線陣列_" + obj.name)
+    coll["_ca_owned"] = True
     bpy.context.scene.collection.children.link(coll)
     s.collection = coll
     return coll
@@ -191,7 +360,84 @@ def _ensure_collection(obj):
 
 def _clear(coll):
     for o in list(coll.objects):
+        me = o.data if o.get("_ca_deformed") else None    # 變形模式的網格是獨立的，要一起收
         bpy.data.objects.remove(o, do_unlink=True)
+        if me is not None and me.users == 0:
+            try:
+                bpy.data.meshes.remove(me)
+            except Exception:
+                pass
+
+
+def _orphan_collections():
+    """曲線被刪掉後，留下來沒有主人的陣列集合。"""
+    tagged = [c for c in bpy.data.collections if c.get("_ca_owned")]
+    if not tagged:
+        return []
+    owned = set()
+    for o in bpy.data.objects:
+        if o.type == 'CURVE':
+            s = getattr(o, 'curve_array', None)
+            if s and s.collection:
+                owned.add(s.collection.name)
+    return [c for c in tagged if c.name not in owned]
+
+
+def _purge_orphans():
+    for coll in _orphan_collections():
+        _clear(coll)
+        try:
+            bpy.data.collections.remove(coll)
+        except Exception:
+            pass
+
+
+def _frame(tan, tilt, align, nrm=None, flip=False):
+    """曲線的區域座標框（X＝沿線方向、Z＝上方向、Y＝側向），含 Ctrl+T 傾斜。
+
+    flip＝繞上方向轉 180°：物件掉頭面向另一端，但不會上下顛倒。
+    """
+    if align and tan.length > 0:
+        if nrm is not None:
+            z = nrm - tan * nrm.dot(tan)
+            if z.length > 1e-9:
+                z.normalize()
+                y = z.cross(tan)
+                mat = Matrix(((tan.x, y.x, z.x),
+                              (tan.y, y.y, z.y),
+                              (tan.z, y.z, z.z)))
+                mat = mat @ Matrix.Rotation(tilt, 3, 'X')
+                return mat @ Matrix.Rotation(math.pi, 3, 'Z') if flip else mat
+        mat = tan.to_track_quat('X', 'Z').to_matrix() @ Matrix.Rotation(tilt, 3, 'X')
+        return mat @ Matrix.Rotation(math.pi, 3, 'Z') if flip else mat
+    mat = Matrix.Rotation(tilt, 3, 'Z') if tilt else Matrix.Identity(3)
+    return mat @ Matrix.Rotation(math.pi, 3, 'Z') if flip else mat
+
+
+def _at_ext(poly, cum, total, d, frames=None, cyclic=False):
+    """超出曲線範圍時：封閉曲線繞回去，開放曲線沿切線外推（否則會被壓扁在端點）。"""
+    if cyclic and total > 1e-9:
+        d = d % total
+    if d < 0.0:
+        pos, tan, tilt, rad, nrm = _at(poly, cum, total, 0.0, frames)
+        return pos + tan * d, tan, tilt, rad, nrm
+    if d > total:
+        pos, tan, tilt, rad, nrm = _at(poly, cum, total, total, frames)
+        return pos + tan * (d - total), tan, tilt, rad, nrm
+    return _at(poly, cum, total, d, frames)
+
+
+def _base_meshes(dg, srcs):
+    """每個來源取一份「修改器已套用」的網格當模板（一次更新只算一次）。"""
+    out = {}
+    for src in set(srcs):
+        if src.type != 'MESH':
+            continue
+        try:
+            out[src.name] = bpy.data.meshes.new_from_object(src.evaluated_get(dg))
+        except Exception:
+            pass
+    return out
 
 
 def _apply_transforms(obj, dups, items):
@@ -201,21 +447,28 @@ def _apply_transforms(obj, dups, items):
                 or any(abs(v) > 1e-6 for v in s.rand_rot)
                 or s.rand_scale > 1e-6)
 
+    # ── 變形模式：把每顆網格自己沿曲線彎過去（滑桿＝0 時完全不走這條路）
+    df = s.deform
+    bases = {}
+    cdata = None
+    if df > 1e-6:
+        cdata = _curve_data(obj)
+        if cdata:
+            dg = bpy.context.evaluated_depsgraph_get()
+            bases = _base_meshes(dg, [it[4] for it in items])
+
     for idx, (dup, item) in enumerate(zip(dups, items)):
-        pos, tan, tilt, rad, _src_ref = item
+        pos, tan, tilt, rad, _src_ref, di, nrm = item
         src = bpy.data.objects.get(dup.get("_ca_src", ""))
         src_rot = src.rotation_euler.to_matrix() if src else Matrix.Identity(3)
         src_scale = Vector(src.scale) if src else Vector((1.0, 1.0, 1.0))
 
-        # 曲線的區域座標框（X＝沿線方向、Y/Z＝側向），含 Ctrl+T 傾斜
-        if s.align and tan.length > 0:
-            rmat = tan.to_track_quat('X', 'Z').to_matrix() @ Matrix.Rotation(tilt, 3, 'X')
-        else:
-            rmat = Matrix.Rotation(tilt, 3, 'Z') if tilt else Matrix.Identity(3)
+        rmat = _frame(tan, tilt, s.align, nrm, s.flip)
 
         m = s.size * rad          # 全域大小 × 曲線半徑(Alt+S)
         loc = pos.copy()
         rnd = Matrix.Identity(3)
+        ofs = Vector((0.0, 0.0, 0.0))
 
         if use_rand:
             # 依種子＋序號產生：結果可重現，不會每次刷新就亂跳
@@ -231,9 +484,58 @@ def _apply_transforms(obj, dups, items):
             if s.rand_scale > 1e-6:
                 m *= 1.0 + rng.uniform(-s.rand_scale, s.rand_scale)
 
+        base = bases.get(src.name) if (src and cdata) else None
+        if base is not None:
+            _deform_dup(dup, base, cdata, s, di,
+                        (src_rot @ off @ rnd), Vector((src_scale.x * m,
+                                                       src_scale.y * m,
+                                                       src_scale.z * m)),
+                        ofs, pos, rmat, df)
+            continue
+
         dup.location = loc
         dup.scale = (src_scale.x * m, src_scale.y * m, src_scale.z * m)
         dup.rotation_euler = (rmat @ src_rot @ off @ rnd).to_euler()
+
+    for me in bases.values():                     # 模板用完就丟，不留孤兒資料
+        try:
+            bpy.data.meshes.remove(me)
+        except Exception:
+            pass
+
+
+def _deform_dup(dup, base, cdata, s, di, rot3, scale, ofs, pos0, rmat0, df):
+    """把 base 的每個頂點依它在曲線上的落點重新擺放，再與「不變形」的結果混合。"""
+    poly, cum, total, cyc, frames = cdata
+    sgn = -1.0 if s.flip else 1.0
+    n = len(base.vertices)
+    if len(dup.data.vertices) != n or not dup.get("_ca_deformed"):
+        old = dup.data
+        dup.data = base.copy()
+        dup["_ca_deformed"] = 1
+        dup.modifiers.clear()                     # 修改器已烘進網格，不能再套一次
+        if old and old.users == 0:
+            try:
+                bpy.data.meshes.remove(old)
+            except Exception:
+                pass
+
+    src_co = [0.0] * (n * 3)
+    base.vertices.foreach_get("co", src_co)
+    out = [0.0] * (n * 3)
+    for i in range(n):
+        v = Vector((src_co[i * 3], src_co[i * 3 + 1], src_co[i * 3 + 2]))
+        p = rot3 @ Vector((v.x * scale.x, v.y * scale.y, v.z * scale.z)) + ofs
+        rigid = pos0 + rmat0 @ p
+        # 反轉時物件的 +X 對到的是曲線的反方向，沿線位移也要跟著反號才不會對不上
+        pos2, tan2, tilt2, _r2, nrm2 = _at_ext(poly, cum, total, di + sgn * p.x, frames, cyc)
+        bent = pos2 + _frame(tan2, tilt2, s.align, nrm2, s.flip) @ Vector((0.0, p.y, p.z))
+        w = rigid.lerp(bent, df)
+        out[i * 3], out[i * 3 + 1], out[i * 3 + 2] = w.x, w.y, w.z
+
+    dup.data.vertices.foreach_set("co", out)
+    dup.data.update()
+    dup.matrix_world = Matrix.Identity(4)         # 座標已經是世界空間
 
 
 def _update_array(obj, rebuild=True, sync_mods=False):
@@ -248,11 +550,14 @@ def _update_array(obj, rebuild=True, sync_mods=False):
         _clear(coll)
         return
     existing = list(coll.objects)
-    need_rebuild = rebuild and (len(existing) != len(items) or s.source_collection is not None)
+    # 變形模式的網格是獨立的、非變形是連結共用 → 兩者切換時一定要重建
+    mode_changed = bool(existing) and bool(existing[0].get("_ca_deformed")) != (s.deform > 1e-6)
+    need_rebuild = mode_changed or (rebuild and (len(existing) != len(items)
+                                                 or s.source_collection is not None))
     if need_rebuild:
         _clear(coll)
         existing = []
-        for (pos, tan, tilt, rad, src) in items:
+        for (pos, tan, tilt, rad, src, dd, nrm) in items:
             dup = src.copy()          # 連結複製：共用網格資料、並帶當下的修改器堆疊
             dup["_curve_array_child"] = 1
             dup["_ca_src"] = src.name
@@ -261,6 +566,8 @@ def _update_array(obj, rebuild=True, sync_mods=False):
             existing.append(dup)
     elif sync_mods:
         for dup in existing:
+            if dup.get("_ca_deformed"):
+                continue              # 變形模式的修改器已烘進網格，每次更新自動重取
             src = bpy.data.objects.get(dup.get("_ca_src", ""))
             if src:
                 _sync_modifiers(src, dup)
@@ -290,6 +597,7 @@ def _process_pending():
             obj = bpy.data.objects.get(name)
             if _ok(obj):
                 _update_array(obj, rebuild=False, sync_mods=False)
+        _purge_orphans()                              # 曲線被刪 → 陣列一起收掉（Ctrl+Z 可復原）
     finally:
         _busy = False
     return None
@@ -328,6 +636,8 @@ def _depsgraph_handler(scene, depsgraph):
         elif dirty:
             _pending.add(obj.name)
             hit = True
+    if not hit and _orphan_collections():
+        hit = True                      # 曲線被刪掉了 → 也要跑一次收尾
     if hit and not bpy.app.timers.is_registered(_process_pending):
         bpy.app.timers.register(_process_pending, first_interval=0.0)
 
@@ -363,10 +673,14 @@ class CurveArraySettings(PropertyGroup):
     collection: PointerProperty(type=bpy.types.Collection)
 
     target: PointerProperty(name="選擇物件", type=bpy.types.Object,
+                            description="要沿曲線排列的物件。選了下面的集合時這裡會失效",
                             poll=_target_poll, update=_prop_update)
     source_collection: PointerProperty(name="選擇集合", type=bpy.types.Collection,
+                                       description="改用整個集合排列：裡面的物件會輪流（或隨機）沿曲線擺放",
                                        update=_prop_update)
-    random_pick: BoolProperty(name="隨機挑選", default=False, update=_prop_update)
+    random_pick: BoolProperty(name="隨機挑選", default=False,
+                              description="從集合裡隨機挑，而不是照順序輪流",
+                              update=_prop_update)
     pick_seed: IntProperty(name="隨機種子", default=0,
                            description="換數字＝換一組「從集合挑哪個物件」的組合（不影響隨機散佈）",
                            update=_prop_update)
@@ -374,16 +688,35 @@ class CurveArraySettings(PropertyGroup):
                       description="換數字＝換一組隨機散佈結果（不影響集合的隨機挑選）",
                       update=_prop_update)
 
-    count: IntProperty(name="數量", default=6, min=1, max=2000, update=_prop_update)
-    size: FloatProperty(name="物件大小", default=1.0, min=0.0, update=_prop_update)
+    count: IntProperty(name="數量", default=6, min=1, max=2000,
+                       description="沿曲線擺放幾個物件",
+                       update=_prop_update)
+    size: FloatProperty(name="物件大小", default=1.0, min=0.0,
+                        description="所有物件的整體縮放倍率（在來源物件自己的尺寸之上）",
+                        update=_prop_update)
     spacing_by_size: FloatProperty(
         name="間距隨曲線大小", default=0.0, min=-3.0, max=3.0,
         description="依曲線半徑(粗細)調整間距。正值＝半徑大處間距大、小處間距小；負值反之；0＝等距",
         update=_prop_update)
-    start: FloatProperty(name="開始位置", default=0.0, min=0.0, max=1.0, update=_prop_update)
-    end: FloatProperty(name="結束位置", default=1.0, min=0.0, max=1.0, update=_prop_update)
-    align: BoolProperty(name="對齊曲線方向", default=True, update=_prop_update)
+    start: FloatProperty(name="開始位置", default=0.0, min=0.0, max=1.0,
+                         description="陣列從曲線的哪裡開始（0＝曲線起點、1＝終點）",
+                         update=_prop_update)
+    end: FloatProperty(name="結束位置", default=1.0, min=0.0, max=1.0,
+                       description="陣列到曲線的哪裡結束（0＝曲線起點、1＝終點）",
+                       update=_prop_update)
+    align: BoolProperty(name="對齊曲線方向", default=True,
+                        description="讓物件順著曲線的走向擺；關掉則維持來源物件原本的朝向",
+                        update=_prop_update)
+    flip: BoolProperty(name="反轉", default=False,
+                       description="讓物件掉頭面向曲線的另一端（不會上下顛倒）",
+                       update=_prop_update)
+    deform: FloatProperty(
+        name="沿曲線變形", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+        description="0＝物件保持原狀直接擺放；1＝物件本身跟著曲線弧度彎曲。"
+                    "開啟後每顆網格獨立（來源的修改器會自動烘進去，不再另外同步）",
+        update=_prop_update)
     rot_offset: FloatVectorProperty(name="物件自轉", subtype='EULER', size=3,
+                                    description="在對齊曲線之後，再把每個物件轉一個固定角度",
                                     default=(0.0, 0.0, 0.0), update=_prop_update)
 
     # 面板分區的收合狀態（純 UI）
@@ -408,6 +741,7 @@ class CurveArraySettings(PropertyGroup):
                               update=_prop_update)
 
     auto_update: BoolProperty(name="自動更新（跟隨曲線）", default=True,
+                              description="開啟＝拉動曲線時陣列即時跟隨，內容鎖定不可選取；關閉＝解鎖，可單獨編輯陣列裡的物件（此時不再跟隨曲線）",
                               update=_auto_update_toggle)
 
 
@@ -417,6 +751,7 @@ class CurveArraySettings(PropertyGroup):
 class CURVEARRAY_OT_create(Operator):
     bl_idname = "curvearray.create"
     bl_label = "創建曲線陣列"
+    bl_description = "在這條曲線上建立陣列，接著在上方指定要排列的物件或集合"
 
     @classmethod
     def poll(cls, context):
@@ -439,6 +774,7 @@ class CURVEARRAY_OT_create(Operator):
 class CURVEARRAY_OT_update(Operator):
     bl_idname = "curvearray.update"
     bl_label = "重新產生"
+    bl_description = "整個重建陣列。畫面沒跟上、或改了來源物件後想強制刷新時用"
 
     def execute(self, context):
         _update_array(context.object, rebuild=True)
@@ -488,6 +824,7 @@ class CURVEARRAY_OT_apply(Operator):
 class CURVEARRAY_OT_clear(Operator):
     bl_idname = "curvearray.clear"
     bl_label = "清除曲線陣列"
+    bl_description = "刪除陣列產生的所有物件（曲線與來源物件都會保留）"
 
     def execute(self, context):
         obj = context.object
@@ -569,7 +906,12 @@ class CURVEARRAY_PT_panel(Panel):
         b = _section(layout, s, "show_object", "物件", 'MESH_DATA')
         if b:
             b.prop(s, "size")
-            b.prop(s, "align")
+            row = b.row(align=True)
+            row.prop(s, "align")
+            sub = row.row(align=True)
+            sub.active = s.align          # 沒對齊曲線時就沒有方向可反轉
+            sub.prop(s, "flip")
+            b.prop(s, "deform", slider=True)
             b.prop(s, "rot_offset")
 
         # ── 曲線外觀：曲線自己的屬性（次要，預設收起）──
