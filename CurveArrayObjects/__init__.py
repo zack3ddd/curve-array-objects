@@ -1,10 +1,10 @@
 bl_info = {
     "name": "CurveArrayObjects",
     "author": "Zack3D",
-    "version": (3, 2, 1),
+    "version": (3, 3, 0),
     "blender": (4, 3, 0),
-    "location": "View3D > N 面板 > 曲線陣列",
-    "description": "沿曲線陣列複製物件或整個集合，可即時跟隨曲線，並支援隨機散佈與沿曲線變形",
+    "location": "View3D > N-panel > Curve Array",
+    "description": "Array objects or a whole collection along a curve, following it live, with random scatter and deform-along-curve",
     "category": "Object",
 }
 
@@ -18,6 +18,125 @@ from bpy.props import (BoolProperty, IntProperty, FloatProperty,
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector, Euler, Matrix
 from mathutils.geometry import interpolate_bezier
+
+
+# ─────────────────────────────────────────────────────────────
+# 介面翻譯（i18n）：UI 字串用英文當原文，附繁中譯文表，跟隨 Blender 語言。
+#   英文介面 → 英文；繁中／簡中介面 → 都顯示繁體（不出簡體）。
+# 掛在專屬翻譯 context（避免「Object」「Curve」等通用字被 Blender 內建翻譯蓋掉）。
+# 繁中同時掛四代碼：zh_HANT/zh_TW（繁）、zh_HANS/zh_CN（簡也顯示繁）。
+# ─────────────────────────────────────────────────────────────
+I18N_CTX = "CurveArrayObjects"
+
+_ZH = {
+    # 屬性名稱
+    "Object to Array": "選擇物件",
+    "Collection": "選擇集合",
+    "Random Pick": "隨機挑選",
+    "Pick Seed": "隨機種子",
+    "Scatter Seed": "隨機種子",
+    "Count": "數量",
+    "Object Size": "物件大小",
+    "Spacing by Curve Size": "間距隨曲線大小",
+    "Start": "開始位置",
+    "End": "結束位置",
+    "Align to Curve": "對齊曲線方向",
+    "Flip": "反轉",
+    "Deform Along Curve": "沿曲線變形",
+    "Object Spin": "物件自轉",
+    "Random Offset": "隨機位移",
+    "Random Rotation": "隨機旋轉",
+    "Random Scale": "隨機縮放",
+    "Auto Update (follow curve)": "自動更新（跟隨曲線）",
+    # 區塊標題（與部分屬性同字）
+    "Source": "來源",
+    "Layout": "排列",
+    "Object": "物件",
+    "Curve Look": "曲線外觀",
+    "Random Scatter": "隨機散佈",
+    # 面板內短標籤
+    "Seed": "種子",
+    "Curve Thickness": "曲線粗細",
+    "Show in Front": "顯示在前面",
+    "Curve Caps": "曲線封口",
+    "Following Curve": "跟隨曲線中",
+    "Unlocked · Editable": "已解鎖・可編輯",
+    "Sync Modifiers": "同步修改器",
+    "Clear": "清除",
+    # 屬性說明（tooltip）
+    "The object to array along the curve. Disabled when a collection is chosen below":
+        "要沿曲線排列的物件。選了下面的集合時這裡會失效",
+    "Array a whole collection instead: its objects are placed along the curve in turn (or at random)":
+        "改用整個集合排列：裡面的物件會輪流（或隨機）沿曲線擺放",
+    "Pick from the collection at random instead of cycling in order":
+        "從集合裡隨機挑，而不是照順序輪流",
+    "Change the number for a different set of which object is picked (does not affect random scatter)":
+        "換數字＝換一組「從集合挑哪個物件」的組合（不影響隨機散佈）",
+    "Change the number for a different random scatter result (does not affect the collection pick)":
+        "換數字＝換一組隨機散佈結果（不影響集合的隨機挑選）",
+    "How many objects to place along the curve": "沿曲線擺放幾個物件",
+    "Overall scale of all objects (on top of the source object's own size)":
+        "所有物件的整體縮放倍率（在來源物件自己的尺寸之上）",
+    "Adjust spacing by curve radius (thickness). Positive = wider where the radius is large, "
+    "tighter where small; negative = the opposite; 0 = even":
+        "依曲線半徑(粗細)調整間距。正值＝半徑大處間距大、小處間距小；負值反之；0＝等距",
+    "Where along the curve the array starts (0 = curve start, 1 = end)":
+        "陣列從曲線的哪裡開始（0＝曲線起點、1＝終點）",
+    "Where along the curve the array ends (0 = curve start, 1 = end)":
+        "陣列到曲線的哪裡結束（0＝曲線起點、1＝終點）",
+    "Make objects follow the curve's direction; turn off to keep the source object's original orientation":
+        "讓物件順著曲線的走向擺；關掉則維持來源物件原本的朝向",
+    "Turn objects to face the other end of the curve (without flipping them upside down)":
+        "讓物件掉頭面向曲線的另一端（不會上下顛倒）",
+    "0 = objects placed as-is; 1 = each object bends along the curve's arc. "
+    "When on, each mesh is independent (the source's modifiers are baked in automatically)":
+        "0＝物件保持原狀直接擺放；1＝物件本身跟著曲線弧度彎曲。"
+        "開啟後每顆網格獨立（來源的修改器會自動烘進去，不再另外同步）",
+    "After aligning to the curve, spin each object by a fixed angle":
+        "在對齊曲線之後，再把每個物件轉一個固定角度",
+    "Expand / collapse the random scatter settings": "展開／收合隨機散佈設定",
+    "Range of random offset per object (±). X = along the curve, Y/Z = sideways":
+        "每個物件隨機位移的範圍（±）。X＝沿曲線、Y/Z＝側向",
+    "Range of random rotation per object (±)": "每個物件隨機旋轉的範圍（±）",
+    "Amount of random scale per object (± ratio, 0.3 = ±30%)":
+        "每個物件隨機縮放的幅度（±比例，0.3＝±30%）",
+    "On = the array follows the curve live and its contents are locked (not selectable); "
+    "Off = unlocked, edit individual objects in the array (no longer follows the curve)":
+        "開啟＝拉動曲線時陣列即時跟隨，內容鎖定不可選取；關閉＝解鎖，可單獨編輯陣列裡的物件（此時不再跟隨曲線）",
+    # 操作按鈕（label / 說明 / 回報）
+    "Create Curve Array": "創建曲線陣列",
+    "Create an array on this curve, then choose the object or collection to array above":
+        "在這條曲線上建立陣列，接著在上方指定要排列的物件或集合",
+    "Regenerate": "重新產生",
+    "Rebuild the whole array. Use when the view didn't keep up, or to force a refresh after changing the source object":
+        "整個重建陣列。畫面沒跟上、或改了來源物件後想強制刷新時用",
+    "Sync Modifiers from Source": "與來源同步修改器",
+    "Re-sync the source object's current modifier stack to every object in the array "
+    "(overwrites per-object modifier tweaks)":
+        "把來源物件目前的修改器堆疊重新同步到陣列裡的所有物件（會覆蓋你對個別物件的修改器調整）",
+    "Synced modifiers on %d objects": "已同步 %d 個物件的修改器",
+    "Apply": "套用",
+    "Keep the current objects and stop following the curve (bake into independent, selectable objects)":
+        "保留目前的物件、停止跟隨曲線（烘焙成獨立物件、解鎖可選）",
+    "Applied (objects kept, no longer following)": "已套用（物件保留、停止跟隨）",
+    "Clear Curve Array": "清除曲線陣列",
+    "Delete all objects the array generated (the curve and source object are kept)":
+        "刪除陣列產生的所有物件（曲線與來源物件都會保留）",
+    # 面板／分頁
+    "Curve Array": "曲線陣列",
+    # 附加元件清單說明
+    "Array objects or a whole collection along a curve, following it live, with random scatter and deform-along-curve":
+        "沿曲線陣列複製物件或整個集合，可即時跟隨曲線，並支援隨機散佈與沿曲線變形",
+}
+
+_ZH_CTX = {(I18N_CTX, en): zh for en, zh in _ZH.items()}
+translations_dict = {"zh_HANT": _ZH_CTX, "zh_TW": _ZH_CTX,
+                     "zh_HANS": _ZH_CTX, "zh_CN": _ZH_CTX}
+
+
+def _t(msgid):
+    """把英文原文翻成目前介面語言（英文介面回傳原文）。"""
+    return bpy.app.translations.pgettext_iface(msgid, I18N_CTX)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -672,76 +791,97 @@ class CurveArraySettings(PropertyGroup):
     enabled: BoolProperty(default=False)
     collection: PointerProperty(type=bpy.types.Collection)
 
-    target: PointerProperty(name="選擇物件", type=bpy.types.Object,
-                            description="要沿曲線排列的物件。選了下面的集合時這裡會失效",
+    target: PointerProperty(name="Object to Array", type=bpy.types.Object,
+                            description="The object to array along the curve. Disabled when a collection is chosen below",
+                            translation_context=I18N_CTX,
                             poll=_target_poll, update=_prop_update)
-    source_collection: PointerProperty(name="選擇集合", type=bpy.types.Collection,
-                                       description="改用整個集合排列：裡面的物件會輪流（或隨機）沿曲線擺放",
+    source_collection: PointerProperty(name="Collection", type=bpy.types.Collection,
+                                       description="Array a whole collection instead: its objects are placed along the curve in turn (or at random)",
+                                       translation_context=I18N_CTX,
                                        update=_prop_update)
-    random_pick: BoolProperty(name="隨機挑選", default=False,
-                              description="從集合裡隨機挑，而不是照順序輪流",
+    random_pick: BoolProperty(name="Random Pick", default=False,
+                              description="Pick from the collection at random instead of cycling in order",
+                              translation_context=I18N_CTX,
                               update=_prop_update)
-    pick_seed: IntProperty(name="隨機種子", default=0,
-                           description="換數字＝換一組「從集合挑哪個物件」的組合（不影響隨機散佈）",
+    pick_seed: IntProperty(name="Pick Seed", default=0,
+                           description="Change the number for a different set of which object is picked (does not affect random scatter)",
+                           translation_context=I18N_CTX,
                            update=_prop_update)
-    seed: IntProperty(name="隨機種子", default=0,
-                      description="換數字＝換一組隨機散佈結果（不影響集合的隨機挑選）",
+    seed: IntProperty(name="Scatter Seed", default=0,
+                      description="Change the number for a different random scatter result (does not affect the collection pick)",
+                      translation_context=I18N_CTX,
                       update=_prop_update)
 
-    count: IntProperty(name="數量", default=6, min=1, max=2000,
-                       description="沿曲線擺放幾個物件",
+    count: IntProperty(name="Count", default=6, min=1, max=2000,
+                       description="How many objects to place along the curve",
+                       translation_context=I18N_CTX,
                        update=_prop_update)
-    size: FloatProperty(name="物件大小", default=1.0, min=0.0,
-                        description="所有物件的整體縮放倍率（在來源物件自己的尺寸之上）",
+    size: FloatProperty(name="Object Size", default=1.0, min=0.0,
+                        description="Overall scale of all objects (on top of the source object's own size)",
+                        translation_context=I18N_CTX,
                         update=_prop_update)
     spacing_by_size: FloatProperty(
-        name="間距隨曲線大小", default=0.0, min=-3.0, max=3.0,
-        description="依曲線半徑(粗細)調整間距。正值＝半徑大處間距大、小處間距小；負值反之；0＝等距",
+        name="Spacing by Curve Size", default=0.0, min=-3.0, max=3.0,
+        description="Adjust spacing by curve radius (thickness). Positive = wider where the radius is large, "
+                    "tighter where small; negative = the opposite; 0 = even",
+        translation_context=I18N_CTX,
         update=_prop_update)
-    start: FloatProperty(name="開始位置", default=0.0, min=0.0, max=1.0,
-                         description="陣列從曲線的哪裡開始（0＝曲線起點、1＝終點）",
+    start: FloatProperty(name="Start", default=0.0, min=0.0, max=1.0,
+                         description="Where along the curve the array starts (0 = curve start, 1 = end)",
+                         translation_context=I18N_CTX,
                          update=_prop_update)
-    end: FloatProperty(name="結束位置", default=1.0, min=0.0, max=1.0,
-                       description="陣列到曲線的哪裡結束（0＝曲線起點、1＝終點）",
+    end: FloatProperty(name="End", default=1.0, min=0.0, max=1.0,
+                       description="Where along the curve the array ends (0 = curve start, 1 = end)",
+                       translation_context=I18N_CTX,
                        update=_prop_update)
-    align: BoolProperty(name="對齊曲線方向", default=True,
-                        description="讓物件順著曲線的走向擺；關掉則維持來源物件原本的朝向",
+    align: BoolProperty(name="Align to Curve", default=True,
+                        description="Make objects follow the curve's direction; turn off to keep the source object's original orientation",
+                        translation_context=I18N_CTX,
                         update=_prop_update)
-    flip: BoolProperty(name="反轉", default=False,
-                       description="讓物件掉頭面向曲線的另一端（不會上下顛倒）",
+    flip: BoolProperty(name="Flip", default=False,
+                       description="Turn objects to face the other end of the curve (without flipping them upside down)",
+                       translation_context=I18N_CTX,
                        update=_prop_update)
     deform: FloatProperty(
-        name="沿曲線變形", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
-        description="0＝物件保持原狀直接擺放；1＝物件本身跟著曲線弧度彎曲。"
-                    "開啟後每顆網格獨立（來源的修改器會自動烘進去，不再另外同步）",
+        name="Deform Along Curve", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+        description="0 = objects placed as-is; 1 = each object bends along the curve's arc. "
+                    "When on, each mesh is independent (the source's modifiers are baked in automatically)",
+        translation_context=I18N_CTX,
         update=_prop_update)
-    rot_offset: FloatVectorProperty(name="物件自轉", subtype='EULER', size=3,
-                                    description="在對齊曲線之後，再把每個物件轉一個固定角度",
+    rot_offset: FloatVectorProperty(name="Object Spin", subtype='EULER', size=3,
+                                    description="After aligning to the curve, spin each object by a fixed angle",
+                                    translation_context=I18N_CTX,
                                     default=(0.0, 0.0, 0.0), update=_prop_update)
 
     # 面板分區的收合狀態（純 UI）
-    show_source: BoolProperty(name="來源", default=True)
-    show_layout: BoolProperty(name="排列", default=True)
-    show_object: BoolProperty(name="物件", default=True)
-    show_curve: BoolProperty(name="曲線外觀", default=False)
+    show_source: BoolProperty(name="Source", default=True, translation_context=I18N_CTX)
+    show_layout: BoolProperty(name="Layout", default=True, translation_context=I18N_CTX)
+    show_object: BoolProperty(name="Object", default=True, translation_context=I18N_CTX)
+    show_curve: BoolProperty(name="Curve Look", default=False, translation_context=I18N_CTX)
 
     # 隨機散佈（用種子產生，可重現）
-    show_random: BoolProperty(name="隨機散佈", default=False,
-                              description="展開／收合隨機散佈設定")
-    rand_loc: FloatVectorProperty(name="隨機位移", subtype='TRANSLATION', size=3,
+    show_random: BoolProperty(name="Random Scatter", default=False,
+                              description="Expand / collapse the random scatter settings",
+                              translation_context=I18N_CTX)
+    rand_loc: FloatVectorProperty(name="Random Offset", subtype='TRANSLATION', size=3,
                                   default=(0.0, 0.0, 0.0), min=0.0,
-                                  description="每個物件隨機位移的範圍（±）。X＝沿曲線、Y/Z＝側向",
+                                  description="Range of random offset per object (±). X = along the curve, Y/Z = sideways",
+                                  translation_context=I18N_CTX,
                                   update=_prop_update)
-    rand_rot: FloatVectorProperty(name="隨機旋轉", subtype='EULER', size=3,
+    rand_rot: FloatVectorProperty(name="Random Rotation", subtype='EULER', size=3,
                                   default=(0.0, 0.0, 0.0), min=0.0,
-                                  description="每個物件隨機旋轉的範圍（±）",
+                                  description="Range of random rotation per object (±)",
+                                  translation_context=I18N_CTX,
                                   update=_prop_update)
-    rand_scale: FloatProperty(name="隨機縮放", default=0.0, min=0.0, max=1.0,
-                              description="每個物件隨機縮放的幅度（±比例，0.3＝±30%）",
+    rand_scale: FloatProperty(name="Random Scale", default=0.0, min=0.0, max=1.0,
+                              description="Amount of random scale per object (± ratio, 0.3 = ±30%)",
+                              translation_context=I18N_CTX,
                               update=_prop_update)
 
-    auto_update: BoolProperty(name="自動更新（跟隨曲線）", default=True,
-                              description="開啟＝拉動曲線時陣列即時跟隨，內容鎖定不可選取；關閉＝解鎖，可單獨編輯陣列裡的物件（此時不再跟隨曲線）",
+    auto_update: BoolProperty(name="Auto Update (follow curve)", default=True,
+                              description="On = the array follows the curve live and its contents are locked (not selectable); "
+                                          "Off = unlocked, edit individual objects in the array (no longer follows the curve)",
+                              translation_context=I18N_CTX,
                               update=_auto_update_toggle)
 
 
@@ -750,8 +890,9 @@ class CurveArraySettings(PropertyGroup):
 # ─────────────────────────────────────────────────────────────
 class CURVEARRAY_OT_create(Operator):
     bl_idname = "curvearray.create"
-    bl_label = "創建曲線陣列"
-    bl_description = "在這條曲線上建立陣列，接著在上方指定要排列的物件或集合"
+    bl_label = "Create Curve Array"
+    bl_description = "Create an array on this curve, then choose the object or collection to array above"
+    bl_translation_context = I18N_CTX
 
     @classmethod
     def poll(cls, context):
@@ -773,8 +914,9 @@ class CURVEARRAY_OT_create(Operator):
 
 class CURVEARRAY_OT_update(Operator):
     bl_idname = "curvearray.update"
-    bl_label = "重新產生"
-    bl_description = "整個重建陣列。畫面沒跟上、或改了來源物件後想強制刷新時用"
+    bl_label = "Regenerate"
+    bl_description = "Rebuild the whole array. Use when the view didn't keep up, or to force a refresh after changing the source object"
+    bl_translation_context = I18N_CTX
 
     def execute(self, context):
         _update_array(context.object, rebuild=True)
@@ -783,8 +925,10 @@ class CURVEARRAY_OT_update(Operator):
 
 class CURVEARRAY_OT_sync_mods(Operator):
     bl_idname = "curvearray.sync_mods"
-    bl_label = "與來源同步修改器"
-    bl_description = "把來源物件目前的修改器堆疊重新同步到陣列裡的所有物件（會覆蓋你對個別物件的修改器調整）"
+    bl_label = "Sync Modifiers from Source"
+    bl_description = ("Re-sync the source object's current modifier stack to every object in the array "
+                     "(overwrites per-object modifier tweaks)")
+    bl_translation_context = I18N_CTX
 
     @classmethod
     def poll(cls, context):
@@ -799,14 +943,15 @@ class CURVEARRAY_OT_sync_mods(Operator):
             if src:
                 _sync_modifiers(src, dup)
                 n += 1
-        self.report({'INFO'}, "已同步 %d 個物件的修改器" % n)
+        self.report({'INFO'}, _t("Synced modifiers on %d objects") % n)
         return {'FINISHED'}
 
 
 class CURVEARRAY_OT_apply(Operator):
     bl_idname = "curvearray.apply"
-    bl_label = "套用"
-    bl_description = "保留目前的物件、停止跟隨曲線（烘焙成獨立物件、解鎖可選）"
+    bl_label = "Apply"
+    bl_description = "Keep the current objects and stop following the curve (bake into independent, selectable objects)"
+    bl_translation_context = I18N_CTX
 
     def execute(self, context):
         obj = context.object
@@ -817,14 +962,15 @@ class CURVEARRAY_OT_apply(Operator):
         s.enabled = False
         s.collection = None
         obj.show_in_front = False
-        self.report({'INFO'}, "已套用（物件保留、停止跟隨）")
+        self.report({'INFO'}, _t("Applied (objects kept, no longer following)"))
         return {'FINISHED'}
 
 
 class CURVEARRAY_OT_clear(Operator):
     bl_idname = "curvearray.clear"
-    bl_label = "清除曲線陣列"
-    bl_description = "刪除陣列產生的所有物件（曲線與來源物件都會保留）"
+    bl_label = "Clear Curve Array"
+    bl_description = "Delete all objects the array generated (the curve and source object are kept)"
+    bl_translation_context = I18N_CTX
 
     def execute(self, context):
         obj = context.object
@@ -850,16 +996,17 @@ def _section(layout, s, prop, label, icon='NONE'):
     head = box.row(align=True)
     head.prop(s, prop, text="", emboss=False,
               icon='TRIA_DOWN' if getattr(s, prop) else 'TRIA_RIGHT')
-    head.label(text=label, icon=icon)
+    head.label(text=_t(label), text_ctxt=I18N_CTX, icon=icon)
     return box if getattr(s, prop) else None
 
 
 class CURVEARRAY_PT_panel(Panel):
-    bl_label = "曲線陣列"
+    bl_label = "Curve Array"
     bl_idname = "VIEW3D_PT_curve_array_objects"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = '曲線陣列'
+    bl_category = 'Curve Array'
+    bl_translation_context = I18N_CTX
 
     @classmethod
     def poll(cls, context):
@@ -875,7 +1022,7 @@ class CURVEARRAY_PT_panel(Panel):
             return
 
         # ── 來源：要排什麼 ──
-        b = _section(layout, s, "show_source", "來源", 'OBJECT_DATA')
+        b = _section(layout, s, "show_source", "Source", 'OBJECT_DATA')
         if b:
             row = b.row()
             row.enabled = not s.source_collection      # 有選集合時，物件欄變灰（集合優先）
@@ -885,17 +1032,17 @@ class CURVEARRAY_PT_panel(Panel):
                 r = b.row(align=True)
                 r.prop(s, "random_pick")
                 if s.random_pick:
-                    r.prop(s, "pick_seed", text="種子")
+                    r.prop(s, "pick_seed", text=_t("Seed"), text_ctxt=I18N_CTX)
 
         # ── 排列：排幾個、排在哪 ──
-        b = _section(layout, s, "show_layout", "排列", 'MOD_ARRAY')
+        b = _section(layout, s, "show_layout", "Layout", 'MOD_ARRAY')
         if b:
             b.prop(s, "count")
             b.prop(s, "spacing_by_size")
             row = b.row(align=True)
             row.prop(s, "start")
             row.prop(s, "end")
-            rb = _section(b, s, "show_random", "隨機散佈", 'MOD_PARTICLES')
+            rb = _section(b, s, "show_random", "Random Scatter", 'MOD_PARTICLES')
             if rb:
                 rb.prop(s, "rand_loc")
                 rb.prop(s, "rand_rot")
@@ -903,7 +1050,7 @@ class CURVEARRAY_PT_panel(Panel):
                 rb.prop(s, "seed")
 
         # ── 物件：排出來長怎樣 ──
-        b = _section(layout, s, "show_object", "物件", 'MESH_DATA')
+        b = _section(layout, s, "show_object", "Object", 'MESH_DATA')
         if b:
             b.prop(s, "size")
             row = b.row(align=True)
@@ -915,12 +1062,12 @@ class CURVEARRAY_PT_panel(Panel):
             b.prop(s, "rot_offset")
 
         # ── 曲線外觀：曲線自己的屬性（次要，預設收起）──
-        b = _section(layout, s, "show_curve", "曲線外觀", 'CURVE_DATA')
+        b = _section(layout, s, "show_curve", "Curve Look", 'CURVE_DATA')
         if b:
-            b.prop(obj.data, "bevel_depth", text="曲線粗細")
+            b.prop(obj.data, "bevel_depth", text=_t("Curve Thickness"), text_ctxt=I18N_CTX)
             row = b.row(align=True)
-            row.prop(obj, "show_in_front", text="顯示在前面")
-            row.prop(obj.data, "use_fill_caps", text="曲線封口")
+            row.prop(obj, "show_in_front", text=_t("Show in Front"), text_ctxt=I18N_CTX)
+            row.prop(obj.data, "use_fill_caps", text=_t("Curve Caps"), text_ctxt=I18N_CTX)
 
         # ── 狀態：跟隨 or 解鎖編輯（狀態直接寫在按鈕上）──
         layout.separator()
@@ -928,19 +1075,22 @@ class CURVEARRAY_PT_panel(Panel):
         r = box.row()
         r.scale_y = 1.3
         if s.auto_update:
-            r.prop(s, "auto_update", toggle=True, icon='LOCKED', text="跟隨曲線中")
+            r.prop(s, "auto_update", toggle=True, icon='LOCKED',
+                   text=_t("Following Curve"), text_ctxt=I18N_CTX)
         else:
-            r.prop(s, "auto_update", toggle=True, icon='UNLOCKED', text="已解鎖・可編輯")
+            r.prop(s, "auto_update", toggle=True, icon='UNLOCKED',
+                   text=_t("Unlocked · Editable"), text_ctxt=I18N_CTX)
 
         # ── 動作 ──
         layout.separator()
         acts = layout.column(align=True)
         row = acts.row(align=True)
         row.operator("curvearray.update", icon='FILE_REFRESH')
-        row.operator("curvearray.sync_mods", text="同步修改器", icon='MODIFIER')
+        row.operator("curvearray.sync_mods", text=_t("Sync Modifiers"),
+                     text_ctxt=I18N_CTX, icon='MODIFIER')
         row = acts.row(align=True)
         row.operator("curvearray.apply", icon='CHECKMARK')
-        row.operator("curvearray.clear", text="清除", icon='X')
+        row.operator("curvearray.clear", text=_t("Clear"), text_ctxt=I18N_CTX, icon='X')
 
 
 classes = (
@@ -955,6 +1105,7 @@ classes = (
 
 
 def register():
+    bpy.app.translations.register(__name__, translations_dict)
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Object.curve_array = PointerProperty(type=CurveArraySettings)
@@ -971,6 +1122,10 @@ def unregister():
         pass
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
+    try:
+        bpy.app.translations.unregister(__name__)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
