@@ -1,5 +1,82 @@
 <!-- 封面圖：在 GitHub 網頁編輯此檔，把封面圖拖到這一行上方，會自動上傳並產生 <img> 連結 -->
 
+# CurveArrayObjects
+
+**English** · [繁體中文](#繁體中文)
+
+Distribute a single object — or an entire collection — along a curve, and **drag the curve to watch everything follow in real time**. No geometry nodes: pick a curve, press one button.
+
+> Made by Zack3D (with AI assistance).
+
+## How is this different from the built-in Array + Curve?
+
+The built-in combo bends **one continuous mesh** along a curve. This add-on places **individual objects** onto the curve — cycle through or randomly pull from a whole collection, give each its own random offset/rotation/scale, and vary the spacing with the curve's thickness.
+
+If bending is all you want, the **Deform along curve** slider does that too — the difference is that each object bends **on its own** while keeping all of the scatter abilities above.
+
+## Features
+
+- Array a **single object** or a **whole collection** along a curve (cycle / random pick, reproducible seed)
+- **Live follow:** drag the curve, `Ctrl+T` tilt, `Alt+S` radius — the array re-lays out / rotates / scales instantly
+- **Deform along curve:** a 0→1 slider that bends each object to the curve's arc
+- **Random scatter:** random offset / rotation / scale, reproducible seed
+- **Spacing by curve size:** spacing follows the curve radius (wider where it's thick, tighter where it's thin)
+- Count, object size, start/end range, align to curve direction (reversible), object spin
+- Curve thickness (bevel), curve caps, show curve in front
+- Generated objects are **non-selectable** by default; turn off "Auto update" to edit the array contents individually
+- Modifiers on the source object **sync automatically** to the array; delete the curve and the array cleans up with it
+- **Apply** = bake into independent objects; **Clear** = remove the array
+
+## Installation
+
+1. Download the latest `.zip` from **Releases** on the right (no need to unzip)
+2. Open Blender → top menu **Edit › Preferences**
+3. Click **Add-ons** on the left → **Install from Disk…** (top-right)
+4. Select the `.zip` you downloaded → install
+5. Tick the checkbox next to "CurveArrayObjects" to enable it
+
+## Usage
+
+1. Select a **curve** → N-panel "Curve Array" → press "Create Curve Array"
+2. Set the object to array under "Select Object" (or use "Select Collection" to cycle / randomize a whole collection)
+3. Adjust count, size, spacing, alignment, etc. → updates live
+4. Enter edit mode and drag the curve, `Ctrl+T`, `Alt+S` → the array follows instantly
+
+## Changelog
+
+### v3.2
+
+- **New "Deform along curve":** a 0→1 slider bends the object itself to the curve's arc; stacks with random scatter and weighted spacing
+- **New "Reverse":** flips objects to face the other end of the curve (without turning them upside down)
+- **Fixed flipping orientation:** direction is now computed with a parallel-transport frame, so vertical curve sections no longer flip
+- **Fixed direction jitter on Bézier curves:** invalid tangents from overlapping segment joints are filtered out
+- **Fixed cracks during deformation:** the direction frame is now interpolated continuously, no longer worsening with face count
+- **Fixed NURBS curves following the control polygon:** the true curve is now evaluated directly
+- **Fixed overlap at the ends of closed curves:** now divided around the loop
+- **Deleting a curve** now clears its matching array as well
+
+### v3.0
+
+- Random scatter (offset / rotation / scale, reproducible seed); UI reorganized into collapsible sections
+
+### v2.x
+
+- Full rewrite to live curve following; support for whole collections and automatic modifier sync
+
+## Compatibility
+
+- Blender 4.3+ / 5.2 LTS
+
+## License
+
+Released under the **GNU GPL**. Author: Zack3D.
+
+---
+
+## 繁體中文
+
+[English ↑](#curvearrayobjects)
+
 # CurveArrayObjects（沿曲線陣列物件）
 
 沿曲線把「一個物件」或「整個集合」分佈排列，**拉動曲線就即時跟著變**。不用碰幾何節點，選一條曲線按一顆按鈕就有。
