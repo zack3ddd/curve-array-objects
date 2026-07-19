@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CurveArrayObjects",
     "author": "Zack3D",
-    "version": (3, 3, 0),
+    "version": (3, 3, 1),
     "blender": (4, 3, 0),
     "location": "View3D > N-panel > Curve Array",
     "description": "Array objects or a whole collection along a curve, following it live, with random scatter and deform-along-curve",
@@ -130,6 +130,9 @@ _ZH = {
 }
 
 _ZH_CTX = {(I18N_CTX, en): zh for en, zh in _ZH.items()}
+# N 面板右側那條直立分頁（bl_category）由 Blender 用「預設 context」翻譯，不吃自訂 context，
+# 所以「Curve Array」要再掛一份到預設 context（"*"），分頁標籤才會跟著變中文。
+_ZH_CTX[("*", "Curve Array")] = "曲線陣列"
 translations_dict = {"zh_HANT": _ZH_CTX, "zh_TW": _ZH_CTX,
                      "zh_HANS": _ZH_CTX, "zh_CN": _ZH_CTX}
 
