@@ -4,27 +4,27 @@
 
 **English** · [繁體中文](#繁體中文)
 
-Distribute a single object — or an entire collection — along a curve, and **drag the curve to watch everything follow in real time**. No geometry nodes: pick a curve, press one button.
+Distribute a single object, or an entire collection, along a curve. Drag the curve and everything follows in real time. No geometry nodes: pick a curve, press one button.
 
 > Made by Zack3D (with AI assistance).
 
 ## How is this different from the built-in Array + Curve?
 
-The built-in combo bends **one continuous mesh** along a curve. This add-on places **individual objects** onto the curve — cycle through or randomly pull from a whole collection, give each its own random offset/rotation/scale, and vary the spacing with the curve's thickness.
+The built-in combo bends one continuous mesh along a curve. This add-on places individual objects onto the curve. You can cycle through or randomly pull from a whole collection, give each its own random offset, rotation and scale, and vary the spacing with the curve's thickness.
 
-If bending is all you want, the **Deform along curve** slider does that too — the difference is that each object bends **on its own** while keeping all of the scatter abilities above.
+If bending is all you want, the Deform along curve slider does that too. The difference is that each object bends on its own, and keeps all the scatter abilities above.
 
 ## Features
 
-- Array a **single object** or a **whole collection** along a curve (cycle / random pick, reproducible seed)
-- **Live follow:** drag the curve, `Ctrl+T` tilt, `Alt+S` radius — the array re-lays out / rotates / scales instantly
+- Array a single object or a whole collection along a curve (cycle / random pick, reproducible seed)
+- **Live follow:** drag the curve, `Ctrl+T` tilt, `Alt+S` radius, and the array re-lays out, rotates and scales instantly
 - **Deform along curve:** a 0→1 slider that bends each object to the curve's arc
 - **Random scatter:** random offset / rotation / scale, reproducible seed
 - **Spacing by curve size:** spacing follows the curve radius (wider where it's thick, tighter where it's thin)
 - Count, object size, start/end range, align to curve direction (reversible), object spin
 - Curve thickness (bevel), curve caps, show curve in front
-- Generated objects are **non-selectable** by default; turn off "Auto update" to edit the array contents individually
-- Modifiers on the source object **sync automatically** to the array; delete the curve and the array cleans up with it
+- Generated objects are non-selectable by default; turn off "Auto update" to edit the array contents individually
+- Modifiers on the source object sync automatically to the array; delete the curve and the array cleans up with it
 - **Apply** = bake into independent objects; **Clear** = remove the array
 
 ## Installation
@@ -79,27 +79,27 @@ Released under the **GNU GPL**. Author: Zack3D.
 
 # CurveArrayObjects（沿曲線陣列物件）
 
-沿曲線把「一個物件」或「整個集合」分佈排列，**拉動曲線就即時跟著變**。不用碰幾何節點，選一條曲線按一顆按鈕就有。
+沿曲線把「一個物件」或「整個集合」分佈排列，拉動曲線就即時跟著變。不用碰幾何節點，選一條曲線按一顆按鈕就有。
 
 > 由 Zack3D 製作（AI 協助）。
 
 ## 跟內建的 Array + Curve 有什麼不同？
 
-內建那套是把**一整條網格沿曲線扭彎**；這個外掛是把**一顆一顆獨立的物件擺到曲線上**——可以輪流或隨機取用整個集合、每顆各自隨機旋轉位移、間距還能依曲線粗細變化。
+內建那套是把一整條網格沿曲線扭彎；這個外掛是把一顆一顆獨立的物件擺到曲線上。可以輪流或隨機取用整個集合、每顆各自隨機旋轉位移，間距還能依曲線粗細變化。
 
-如果你就是想要彎曲，「沿曲線變形」滑桿也做得到——差別在於它是**每顆各自彎**，同時保有上面那些散佈能力。
+如果你就是想要彎曲，「沿曲線變形」滑桿也做得到。差別在於它是每顆各自彎，同時保有上面那些散佈能力。
 
 ## 功能
 
-- 沿曲線陣列**單一物件**或**整個集合**（輪流／隨機挑選，種子可重現）
+- 沿曲線陣列單一物件或整個集合（輪流／隨機挑選，種子可重現）
 - **即時跟隨**：拉曲線、`Ctrl+T` 傾斜、`Alt+S` 半徑，陣列即時重排／旋轉／縮放
 - **沿曲線變形**：0→1 滑桿，讓每顆物件自己順著曲線弧度彎曲
 - **隨機散佈**：隨機位移／旋轉／縮放，種子可重現
 - **間距隨曲線大小**：依曲線半徑調整間距（大處大、小處小）
 - 數量、物件大小、開始／結束範圍、對齊曲線方向（可反轉）、物件自轉
 - 曲線粗細（bevel）、曲線封口、曲線顯示在前面
-- 生成物件預設**不可選取**；關掉「自動更新」即可個別編輯陣列內容
-- 來源物件的修改器會**自動同步**到陣列；刪掉曲線，陣列會一起收乾淨
+- 生成物件預設不可選取；關掉「自動更新」即可個別編輯陣列內容
+- 來源物件的修改器會自動同步到陣列；刪掉曲線，陣列會一起收乾淨
 - **套用**＝烘焙成獨立物件；**清除**移除陣列
 
 ## 安裝教學
