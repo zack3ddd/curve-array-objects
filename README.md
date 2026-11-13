@@ -65,7 +65,7 @@ If bending is all you want, the Deform along curve slider does that too. The dif
 
 ## Compatibility
 
-- Blender 4.3+ / 5.2 LTS
+- Blender 4.3+ / 5.2 LTS / 5.3
 
 ## License
 
@@ -140,7 +140,7 @@ Released under the **GNU GPL**. Author: Zack3D.
 
 ## 對應版本
 
-- Blender 4.3 以上 / 5.2 LTS
+- Blender 4.3 以上 / 5.2 LTS / 5.3
 
 ## 授權
 
